@@ -1,4 +1,3 @@
-use bstr::ByteSlice;
 use std::io::Read;
 use uuid::Uuid;
 
@@ -17,7 +16,7 @@ fn accept_connections() -> anyhow::Result<()> {
 
     socket.register_service("Spotify Car Thing", GUID_SPOTIFY)?;
 
-    loop {
+    'outer: loop {
         let mut sock = socket.accept()?;
         println!(
             "Connection received from {:04x}{:08x} to port {}",
@@ -27,13 +26,21 @@ fn accept_connections() -> anyhow::Result<()> {
         );
 
         loop {
-            let mut buf = [0; 512];
-            let len = sock.read(&mut buf)?;
-            if len == 0 {
-                println!("device disconnected");
-                break;
+            let mut msg_len = [0; 4];
+            if let Err(e) = sock.read_exact(&mut msg_len) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    println!("device disconnected");
+                    continue 'outer;
+                } else {
+                    return Err(e.into());
+                }
             }
-            println!("received: {:?}", buf[..len].as_bstr());
+
+            let msg_len = u32::from_be_bytes(msg_len);
+            println!("msg len: {}", msg_len);
+
+            let v = rmpv::decode::read_value(&mut sock)?;
+            println!("received: {:#}", v);
         }
     }
 }
