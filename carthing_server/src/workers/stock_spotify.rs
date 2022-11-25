@@ -1,32 +1,101 @@
 use anyhow::Context;
 use anyhow::Result;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 
-pub struct SpotifyConnectionWorker<S> {
-    sock: S,
-    out_buf: Vec<u8>,
+/// A client to interact with the spotify car thing
+pub struct CarthingClient {
+    tx_worker: std::thread::JoinHandle<()>,
+    rx_worker: std::thread::JoinHandle<()>,
+    wamp_worker: std::thread::JoinHandle<()>,
 
-    is_authed: bool,
-
-    next_sub_id: usize,
-    subs: HashMap<String, Vec<usize>>,
+    topic_tx: Sender<(String, serde_json::Value, usize)>,
 }
 
-impl<S: Read + Write> SpotifyConnectionWorker<S> {
-    pub fn new(sock: S) -> Self {
-        Self {
-            sock,
-            out_buf: Vec::new(),
-            is_authed: false,
-            next_sub_id: 1,
-            subs: HashMap::new(),
-        }
+impl CarthingClient {
+    pub fn new(
+        read_sock: Box<dyn Read + Send>,
+        write_sock: Box<dyn Write + Send>,
+    ) -> Result<CarthingClient> {
+        let (in_tx, in_rx) = crossbeam_channel::unbounded();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded();
+        let (topic_tx, topic_rx) = crossbeam_channel::unbounded();
+
+        let tx_worker = {
+            std::thread::spawn(move || {
+                if let Err(e) = SpotifyTxWorker::new(write_sock, out_rx).run() {
+                    println!("socket send error: {:?}", e);
+                }
+            })
+        };
+
+        let rx_worker = {
+            std::thread::spawn(move || {
+                if let Err(e) = SpotifyRxWorker::new(read_sock, in_tx).run() {
+                    println!("socket recv error: {:?}", e);
+                }
+            })
+        };
+
+        let wamp_worker = {
+            std::thread::spawn(move || {
+                if let Err(e) = SpotifyWampWorker::new(in_rx, out_tx, topic_rx).run() {
+                    println!("socket recv error: {:?}", e);
+                }
+            })
+        };
+
+        Ok(CarthingClient {
+            tx_worker,
+            rx_worker,
+            wamp_worker,
+
+            topic_tx,
+        })
     }
 
-    pub fn run(mut self) -> Result<()> {
+    pub fn raw_publish(
+        &self,
+        topic: String,
+        msg: serde_json::Value,
+        pub_id: usize,
+    ) -> anyhow::Result<()> {
+        self.topic_tx.send((topic, msg, pub_id))?;
+        Ok(())
+    }
+
+    pub fn wait_for_shutdown(self) -> Result<()> {
+        if self.tx_worker.join().is_err() {
+            println!("tx_worker panicked!")
+        }
+
+        if self.rx_worker.join().is_err() {
+            println!("rx_worker panicked!")
+        }
+
+        if self.wamp_worker.join().is_err() {
+            println!("wamp_worker panicked!")
+        }
+
+        Ok(())
+    }
+}
+
+struct SpotifyRxWorker {
+    sock: Box<dyn Read>,
+    send: Sender<(u32, serde_json::Value)>,
+}
+
+impl SpotifyRxWorker {
+    fn new(sock: Box<dyn Read>, send: Sender<(u32, serde_json::Value)>) -> Self {
+        Self { sock, send }
+    }
+
+    fn run(mut self) -> anyhow::Result<()> {
         loop {
             let mut msg_len = [0; 4];
             if let Err(e) = self.sock.read_exact(&mut msg_len) {
@@ -37,43 +106,131 @@ impl<S: Read + Write> SpotifyConnectionWorker<S> {
                     return Err(e.into());
                 }
             }
+            let msg_len = u32::from_be_bytes(msg_len);
 
             let msg = serde_transcode::transcode(
                 &mut rmp_serde::decode::Deserializer::new(&mut self.sock),
                 serde_json::value::Serializer,
             )?;
 
-            println!("recv <-- {:>4}|{}", u32::from_be_bytes(msg_len), msg);
-
-            let serde_json::Value::Array(msg) = msg else {
-                anyhow::bail!("unexpected msg: expected array")
-            };
-
-            let res = self
-                .process_packet(msg)
-                .context("while processing packet")?;
-
-            // jank in-band signalling to skip response
-            if !res.is_null() {
-                self.raw_send(res)?;
+            {
+                println!("recv <-- {:>4}|{}", msg_len, msg);
             }
+
+            self.send.send((msg_len, msg))?;
+        }
+    }
+}
+
+struct SpotifyTxWorker {
+    sock: Box<dyn Write>,
+    recv: Receiver<serde_json::Value>,
+}
+
+impl SpotifyTxWorker {
+    fn new(sock: Box<dyn Write>, recv: Receiver<serde_json::Value>) -> Self {
+        Self { sock, recv }
+    }
+
+    fn run(mut self) -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        loop {
+            let res = self.recv.recv()?;
+
+            rmp_serde::encode::write_named(&mut buf, &res)?;
+
+            {
+                let v = rmpv::decode::read_value(&mut std::io::Cursor::new(buf.clone()))?;
+                println!("send --> {:>4}|{:#}", buf.len(), v);
+            }
+
+            self.sock.write_all(&(buf.len() as u32).to_be_bytes())?;
+            self.sock.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+}
+
+struct SpotifyWampWorker {
+    rx: Receiver<(u32, serde_json::Value)>,
+    tx: Sender<serde_json::Value>,
+    topic_rx: Receiver<(String, serde_json::Value, usize)>,
+
+    is_authed: bool,
+    next_sub_id: usize,
+    subs: HashMap<String, usize>,
+}
+
+impl SpotifyWampWorker {
+    fn new(
+        rx: Receiver<(u32, serde_json::Value)>,
+        tx: Sender<serde_json::Value>,
+        topic_rx: Receiver<(String, serde_json::Value, usize)>,
+    ) -> Self {
+        Self {
+            rx,
+            tx,
+            topic_rx,
+
+            is_authed: false,
+            next_sub_id: 1,
+            subs: HashMap::new(),
         }
     }
 
-    fn raw_send(&mut self, res: serde_json::Value) -> Result<()> {
-        rmp_serde::encode::write_named(&mut self.out_buf, &res)?;
-
-        {
-            let v = rmpv::decode::read_value(&mut std::io::Cursor::new(self.out_buf.clone()))?;
-            println!("send --> {:>4}|{:#}", self.out_buf.len(), v);
+    fn run(mut self) -> Result<()> {
+        enum Event {
+            Msg(u32, serde_json::Value),
+            Topic(String, serde_json::Value, usize),
         }
 
-        self.sock
-            .write_all(&(self.out_buf.len() as u32).to_be_bytes())?;
-        self.sock.write_all(&self.out_buf)?;
-        self.out_buf.clear();
+        loop {
+            let event = crossbeam_channel::select! {
+                recv(self.rx) -> msg => {
+                    let (len, msg) = msg?;
+                    Event::Msg(len, msg)
+                },
+                recv(self.topic_rx) -> msg => {
+                    let (topic, details, pub_id) = msg?;
+                    Event::Topic(topic, details, pub_id)
+                },
+            };
 
-        Ok(())
+            match event {
+                Event::Msg(_len, msg) => {
+                    let serde_json::Value::Array(msg) = msg else {
+                        anyhow::bail!("unexpected msg: expected array")
+                    };
+
+                    let res = self
+                        .process_packet(msg)
+                        .context("while processing packet")?;
+
+                    // jank in-band signalling to skip response
+                    if !res.is_null() {
+                        self.tx.send(res)?;
+                    }
+                }
+                Event::Topic(topic, details, pub_id) => {
+                    let sub_id = match self.subs.get("topic") {
+                        Some(sub) => sub,
+                        None => {
+                            println!("warning: not subscribed to topic: {topic}");
+                            return Ok(());
+                        }
+                    };
+
+                    self.tx.send(json!([
+                        WampMsgCode::Event as u64,
+                        sub_id,
+                        pub_id,
+                        {},
+                        [],
+                        details
+                    ]))?;
+                }
+            }
+        }
     }
 
     fn handle_auth(
@@ -227,8 +384,8 @@ impl<S: Read + Write> SpotifyConnectionWorker<S> {
     fn handle_rpc(
         &self,
         proc: &str,
-        args: &[serde_json::Value],
-        kwargs: &serde_json::Map<String, serde_json::Value>,
+        _args: &[serde_json::Value],
+        _kwargs: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let res = match proc {
             "com.spotify.superbird.pitstop.log"
@@ -260,29 +417,8 @@ impl<S: Read + Write> SpotifyConnectionWorker<S> {
 
         let sub_id = self.next_sub_id;
         self.next_sub_id += 1;
-        self.subs.entry(topic.to_owned()).or_default().push(sub_id);
+        *self.subs.entry(topic.to_owned()).or_default() = sub_id;
         Ok(sub_id)
-    }
-
-    fn publish(&mut self, topic: &str, details: serde_json::Value, pub_id: usize) -> Result<()> {
-        let subs = self
-            .subs
-            .get("topic")
-            .context(format!("unknown topic: {}", topic))?
-            .clone(); // bleh clone
-
-        for sub_id in subs {
-            self.raw_send(json!([
-                WampMsgCode::Event as u64,
-                sub_id,
-                pub_id,
-                {},
-                [],
-                details
-            ]))?;
-        }
-
-        Ok(())
     }
 }
 

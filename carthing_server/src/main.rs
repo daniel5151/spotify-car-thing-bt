@@ -26,7 +26,14 @@ fn accept_bt_connections() -> Result<()> {
             sock.port()
         );
 
-        workers::stock_spotify::SpotifyConnectionWorker::new(sock).run()?;
+        let carthing_client = workers::stock_spotify::CarthingClient::new(
+            Box::new(sock.try_clone()?),
+            Box::new(sock),
+        )?;
+
+        if carthing_client.wait_for_shutdown().is_err() {
+            println!("could not cleanly join workers")
+        }
     }
 }
 

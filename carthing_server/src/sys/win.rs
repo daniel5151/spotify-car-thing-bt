@@ -7,6 +7,7 @@ use windows::core::GUID;
 use windows::core::PWSTR;
 use windows::Win32::Devices::Bluetooth::*;
 use windows::Win32::Networking::WinSock::*;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 
 pub fn platform_init() -> anyhow::Result<()> {
     let mut wsa_data = WSADATA::default();
@@ -143,6 +144,30 @@ impl WinBtSockStream {
 
     pub fn port(&self) -> u32 {
         self.sa.port
+    }
+
+    pub fn try_clone(&self) -> anyhow::Result<Self> {
+        let mut info = WSAPROTOCOL_INFOW::default();
+        let res = unsafe { WSADuplicateSocketW(self.s, GetCurrentProcessId(), &mut info) };
+        if res != 0 {
+            anyhow::bail!("failed to duplicate socket: {:?}", wsa_get_last_error())
+        }
+        let s = unsafe {
+            WSASocketW(
+                info.iAddressFamily,
+                info.iSocketType,
+                info.iProtocol,
+                Some(&info),
+                0,
+                0,
+            )
+        };
+
+        if s == INVALID_SOCKET {
+            anyhow::bail!("failed to create socket");
+        }
+
+        Ok(WinBtSockStream { s, sa: self.sa })
     }
 }
 
