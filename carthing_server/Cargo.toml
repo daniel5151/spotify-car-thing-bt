@@ -7,8 +7,10 @@ edition = "2021"
 anyhow = "1.0"
 cfg-if = "1.0"
 chrono = "0.4"
+num_enum = "0.5.7"
 rmp-serde = "1.1"
-rmpv = { version = "1.0", features = ["with-serde"] }
+rmpv = "1.0.0"
+serde-transcode = "1.1"
 serde_json = "1.0"
 uuid = "1.2"
 

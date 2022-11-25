@@ -26,7 +26,7 @@ fn accept_bt_connections() -> Result<()> {
             sock.port()
         );
 
-        workers::stock_spotify::SpotifyConnectionWorker::new().run(sock)?;
+        workers::stock_spotify::SpotifyConnectionWorker::new(sock).run()?;
     }
 }
 
