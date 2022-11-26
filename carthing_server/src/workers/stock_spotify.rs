@@ -7,67 +7,60 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 
-/// A client to interact with the spotify car thing
-pub struct CarthingClient {
-    tx_worker: std::thread::JoinHandle<()>,
-    rx_worker: std::thread::JoinHandle<()>,
-    wamp_worker: std::thread::JoinHandle<()>,
-
-    topic_tx: Sender<(String, serde_json::Value, usize)>,
+pub struct CarThingServerChans {
+    pub topic_tx: Sender<(String, serde_json::Value, usize)>,
 }
 
-impl CarthingClient {
-    pub fn new(
-        read_sock: Box<dyn Read + Send>,
-        write_sock: Box<dyn Write + Send>,
-    ) -> Result<CarthingClient> {
-        let (in_tx, in_rx) = crossbeam_channel::unbounded();
-        let (out_tx, out_rx) = crossbeam_channel::unbounded();
-        let (topic_tx, topic_rx) = crossbeam_channel::unbounded();
+pub fn spawn_car_thing_server(
+    rx_sock: Box<dyn Read + Send>,
+    tx_sock: Box<dyn Write + Send>,
+) -> Result<(CarThingServerHandles, CarThingServerChans)> {
+    let (in_tx, in_rx) = crossbeam_channel::unbounded();
+    let (out_tx, out_rx) = crossbeam_channel::unbounded();
+    let (topic_tx, topic_rx) = crossbeam_channel::unbounded();
 
-        let tx_worker = {
-            std::thread::spawn(move || {
-                if let Err(e) = SpotifyTxWorker::new(write_sock, out_rx).run() {
-                    println!("socket send error: {:?}", e);
-                }
-            })
-        };
+    let tx_worker = {
+        std::thread::spawn(move || {
+            if let Err(e) = CarThingTxWorker::new(tx_sock, out_rx).run() {
+                println!("socket send error: {:?}", e);
+            }
+        })
+    };
 
-        let rx_worker = {
-            std::thread::spawn(move || {
-                if let Err(e) = SpotifyRxWorker::new(read_sock, in_tx).run() {
-                    println!("socket recv error: {:?}", e);
-                }
-            })
-        };
+    let rx_worker = {
+        std::thread::spawn(move || {
+            if let Err(e) = CarThingRxWorker::new(rx_sock, in_tx).run() {
+                println!("socket recv error: {:?}", e);
+            }
+        })
+    };
 
-        let wamp_worker = {
-            std::thread::spawn(move || {
-                if let Err(e) = SpotifyWampWorker::new(in_rx, out_tx, topic_rx).run() {
-                    println!("socket recv error: {:?}", e);
-                }
-            })
-        };
+    let wamp_worker = {
+        std::thread::spawn(move || {
+            if let Err(e) = CarThingWampWorker::new(in_rx, out_tx, topic_rx).run() {
+                println!("socket recv error: {:?}", e);
+            }
+        })
+    };
 
-        Ok(CarthingClient {
+    Ok((
+        CarThingServerHandles {
             tx_worker,
             rx_worker,
             wamp_worker,
+        },
+        CarThingServerChans { topic_tx },
+    ))
+}
 
-            topic_tx,
-        })
-    }
+/// A client to interact with the spotify car thing
+pub struct CarThingServerHandles {
+    tx_worker: std::thread::JoinHandle<()>,
+    rx_worker: std::thread::JoinHandle<()>,
+    wamp_worker: std::thread::JoinHandle<()>,
+}
 
-    pub fn raw_publish(
-        &self,
-        topic: String,
-        msg: serde_json::Value,
-        pub_id: usize,
-    ) -> anyhow::Result<()> {
-        self.topic_tx.send((topic, msg, pub_id))?;
-        Ok(())
-    }
-
+impl CarThingServerHandles {
     pub fn wait_for_shutdown(self) -> Result<()> {
         if self.tx_worker.join().is_err() {
             println!("tx_worker panicked!")
@@ -85,17 +78,17 @@ impl CarthingClient {
     }
 }
 
-struct SpotifyRxWorker {
+pub struct CarThingRxWorker {
     sock: Box<dyn Read>,
     send: Sender<(u32, serde_json::Value)>,
 }
 
-impl SpotifyRxWorker {
-    fn new(sock: Box<dyn Read>, send: Sender<(u32, serde_json::Value)>) -> Self {
+impl CarThingRxWorker {
+    pub fn new(sock: Box<dyn Read>, send: Sender<(u32, serde_json::Value)>) -> Self {
         Self { sock, send }
     }
 
-    fn run(mut self) -> anyhow::Result<()> {
+    pub fn run(mut self) -> anyhow::Result<()> {
         loop {
             let mut msg_len = [0; 4];
             if let Err(e) = self.sock.read_exact(&mut msg_len) {
@@ -122,17 +115,17 @@ impl SpotifyRxWorker {
     }
 }
 
-struct SpotifyTxWorker {
+pub struct CarThingTxWorker {
     sock: Box<dyn Write>,
     recv: Receiver<serde_json::Value>,
 }
 
-impl SpotifyTxWorker {
-    fn new(sock: Box<dyn Write>, recv: Receiver<serde_json::Value>) -> Self {
+impl CarThingTxWorker {
+    pub fn new(sock: Box<dyn Write>, recv: Receiver<serde_json::Value>) -> Self {
         Self { sock, recv }
     }
 
-    fn run(mut self) -> anyhow::Result<()> {
+    pub fn run(mut self) -> anyhow::Result<()> {
         let mut buf = Vec::new();
         loop {
             let res = self.recv.recv()?;
@@ -151,7 +144,7 @@ impl SpotifyTxWorker {
     }
 }
 
-struct SpotifyWampWorker {
+pub struct CarThingWampWorker {
     rx: Receiver<(u32, serde_json::Value)>,
     tx: Sender<serde_json::Value>,
     topic_rx: Receiver<(String, serde_json::Value, usize)>,
@@ -161,8 +154,8 @@ struct SpotifyWampWorker {
     subs: HashMap<String, usize>,
 }
 
-impl SpotifyWampWorker {
-    fn new(
+impl CarThingWampWorker {
+    pub fn new(
         rx: Receiver<(u32, serde_json::Value)>,
         tx: Sender<serde_json::Value>,
         topic_rx: Receiver<(String, serde_json::Value, usize)>,
@@ -178,7 +171,7 @@ impl SpotifyWampWorker {
         }
     }
 
-    fn run(mut self) -> Result<()> {
+    pub fn run(mut self) -> Result<()> {
         enum Event {
             Msg(u32, serde_json::Value),
             Topic(String, serde_json::Value, usize),
