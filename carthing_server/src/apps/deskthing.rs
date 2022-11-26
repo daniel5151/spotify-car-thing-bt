@@ -1,5 +1,6 @@
-use crate::workers::json_websocket::spawn_json_websocket_server;
-use crate::workers::stock_spotify::spawn_car_thing_server;
+use crate::workers::deskthing_bridge::spawn_deskthing_bridge_workers;
+use crate::workers::json_websocket::spawn_json_websocket_workers;
+use crate::workers::stock_spotify::spawn_car_thing_workers;
 use crate::workers::stock_spotify::CarThingServerChans;
 use anyhow::Context;
 use anyhow::Result;
@@ -27,12 +28,22 @@ pub fn run_deskthing() -> Result<()> {
 
     // for now, only support 1:1 spotify client <-> carthing
     loop {
+        let ws_stream = {
+            println!("waiting for ws connection on 127.0.0.1:{DESKTHING_PORT}...");
+            let (ws_stream, ws_addr) = ws_server.accept().context("accepting ws connection")?;
+            println!("accepted ws connection from {}", ws_addr);
+            ws_stream
+        };
+
+        let (ws_server, ws_tx, ws_rx) =
+            spawn_json_websocket_workers(ws_stream).context("constructing ws server")?;
+
         let bt_sock = {
             println!(
                 "waiting for bt connection on RFCOMM port {}...",
                 bt_socket.rfcomm_port()
             );
-            let bt_sock = bt_socket.accept()?;
+            let bt_sock = bt_socket.accept().context("accepting bt connection")?;
             println!(
                 "Connection received from {:04x}{:08x} to port {}",
                 bt_sock.nap(),
@@ -42,19 +53,12 @@ pub fn run_deskthing() -> Result<()> {
             bt_sock
         };
 
-        let ws_stream = {
-            println!("waiting for ws connection on 127.0.0.1:{DESKTHING_PORT}...");
-            let (ws_stream, ws_addr) = ws_server.accept().context("accepting connection")?;
-            println!("accepted ws connection from {}", ws_addr);
-            ws_stream
-        };
-
-        let (ws_server, ws_tx, ws_rx) =
-            spawn_json_websocket_server(ws_stream).context("constructing ws server")?;
-
         let (car_thing_server, CarThingServerChans { topic_tx }) =
-            spawn_car_thing_server(Box::new(bt_sock.try_clone()?), Box::new(bt_sock))
+            spawn_car_thing_workers(Box::new(bt_sock.try_clone()?), Box::new(bt_sock))
                 .context("constructing carthing client")?;
+
+        let deskthing_server = spawn_deskthing_bridge_workers(ws_tx, ws_rx, topic_tx)
+            .context("constructing deskthing bridge server")?;
 
         // let the servers run
         {
@@ -64,6 +68,10 @@ pub fn run_deskthing() -> Result<()> {
 
             if car_thing_server.wait_for_shutdown().is_err() {
                 println!("car_thing_server did not shut down cleanly")
+            }
+
+            if deskthing_server.wait_for_shutdown().is_err() {
+                println!("deskthing_server did not shut down cleanly")
             }
         }
     }

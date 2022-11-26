@@ -16,7 +16,7 @@ impl TryCloneIo for std::net::TcpStream {
     }
 }
 
-pub fn spawn_json_websocket_server(
+pub fn spawn_json_websocket_workers(
     stream: impl TryCloneIo,
 ) -> anyhow::Result<(
     JsonWebsocketServerHandles,
@@ -36,13 +36,15 @@ pub fn spawn_json_websocket_server(
 
     let ws_rx_worker = std::thread::spawn(move || {
         if let Err(e) = JsonWebsocketRxWorker::new(ws_rx, in_tx).run() {
-            println!("ws recv error: {}", e)
+            println!("ws recv error: {:?}", e);
+            std::process::abort();
         }
     });
 
     let ws_tx_worker = std::thread::spawn(move || {
         if let Err(e) = JsonWebsocketTxWorker::new(ws_tx, out_rx).run() {
-            println!("ws recv error: {}", e)
+            println!("ws recv error: {:?}", e);
+            std::process::abort();
         }
     });
 
@@ -92,7 +94,7 @@ impl<S: Read + Write> JsonWebsocketRxWorker<S> {
                 tungstenite::Message::Binary(v) => serde_json::from_slice(&v)?,
                 other => anyhow::bail!("unexpected ws message {}", other),
             };
-            self.in_tx.send(msg).context("in recv callback")?;
+            self.in_tx.send(msg).context("could not send msg")?;
         }
     }
 }

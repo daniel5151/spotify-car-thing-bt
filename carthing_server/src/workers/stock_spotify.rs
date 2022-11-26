@@ -11,7 +11,7 @@ pub struct CarThingServerChans {
     pub topic_tx: Sender<(String, serde_json::Value, usize)>,
 }
 
-pub fn spawn_car_thing_server(
+pub fn spawn_car_thing_workers(
     rx_sock: Box<dyn Read + Send>,
     tx_sock: Box<dyn Write + Send>,
 ) -> Result<(CarThingServerHandles, CarThingServerChans)> {
@@ -23,6 +23,7 @@ pub fn spawn_car_thing_server(
         std::thread::spawn(move || {
             if let Err(e) = CarThingTxWorker::new(tx_sock, out_rx).run() {
                 println!("socket send error: {:?}", e);
+                std::process::abort();
             }
         })
     };
@@ -31,6 +32,7 @@ pub fn spawn_car_thing_server(
         std::thread::spawn(move || {
             if let Err(e) = CarThingRxWorker::new(rx_sock, in_tx).run() {
                 println!("socket recv error: {:?}", e);
+                std::process::abort();
             }
         })
     };
@@ -39,6 +41,7 @@ pub fn spawn_car_thing_server(
         std::thread::spawn(move || {
             if let Err(e) = CarThingWampWorker::new(in_rx, out_tx, topic_rx).run() {
                 println!("socket recv error: {:?}", e);
+                std::process::abort();
             }
         })
     };
@@ -78,17 +81,17 @@ impl CarThingServerHandles {
     }
 }
 
-pub struct CarThingRxWorker {
+struct CarThingRxWorker {
     sock: Box<dyn Read>,
     send: Sender<(u32, serde_json::Value)>,
 }
 
 impl CarThingRxWorker {
-    pub fn new(sock: Box<dyn Read>, send: Sender<(u32, serde_json::Value)>) -> Self {
+    fn new(sock: Box<dyn Read>, send: Sender<(u32, serde_json::Value)>) -> Self {
         Self { sock, send }
     }
 
-    pub fn run(mut self) -> anyhow::Result<()> {
+    fn run(mut self) -> anyhow::Result<()> {
         loop {
             let mut msg_len = [0; 4];
             if let Err(e) = self.sock.read_exact(&mut msg_len) {
@@ -115,17 +118,17 @@ impl CarThingRxWorker {
     }
 }
 
-pub struct CarThingTxWorker {
+struct CarThingTxWorker {
     sock: Box<dyn Write>,
     recv: Receiver<serde_json::Value>,
 }
 
 impl CarThingTxWorker {
-    pub fn new(sock: Box<dyn Write>, recv: Receiver<serde_json::Value>) -> Self {
+    fn new(sock: Box<dyn Write>, recv: Receiver<serde_json::Value>) -> Self {
         Self { sock, recv }
     }
 
-    pub fn run(mut self) -> anyhow::Result<()> {
+    fn run(mut self) -> anyhow::Result<()> {
         let mut buf = Vec::new();
         loop {
             let res = self.recv.recv()?;
@@ -144,7 +147,7 @@ impl CarThingTxWorker {
     }
 }
 
-pub struct CarThingWampWorker {
+struct CarThingWampWorker {
     rx: Receiver<(u32, serde_json::Value)>,
     tx: Sender<serde_json::Value>,
     topic_rx: Receiver<(String, serde_json::Value, usize)>,
@@ -155,7 +158,7 @@ pub struct CarThingWampWorker {
 }
 
 impl CarThingWampWorker {
-    pub fn new(
+    fn new(
         rx: Receiver<(u32, serde_json::Value)>,
         tx: Sender<serde_json::Value>,
         topic_rx: Receiver<(String, serde_json::Value, usize)>,
@@ -171,7 +174,7 @@ impl CarThingWampWorker {
         }
     }
 
-    pub fn run(mut self) -> Result<()> {
+    fn run(mut self) -> Result<()> {
         enum Event {
             Msg(u32, serde_json::Value),
             Topic(String, serde_json::Value, usize),
@@ -205,11 +208,11 @@ impl CarThingWampWorker {
                     }
                 }
                 Event::Topic(topic, details, pub_id) => {
-                    let sub_id = match self.subs.get("topic") {
+                    let sub_id = match self.subs.get(&topic) {
                         Some(sub) => sub,
                         None => {
                             println!("warning: not subscribed to topic: {topic}");
-                            return Ok(());
+                            continue;
                         }
                     };
 
@@ -393,7 +396,11 @@ impl CarThingWampWorker {
                 json!({ "can_use_superbird": true })
             }
             "com.spotify.superbird.register_device" => json!({}),
-            _ => anyhow::bail!("unknown RPC: {proc}"),
+
+            _ => {
+                println!("warning: unknown RPC: {proc}");
+                json!(null)
+            }
         };
 
         Ok(res)
