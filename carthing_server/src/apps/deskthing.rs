@@ -53,12 +53,26 @@ pub fn run_deskthing() -> Result<()> {
             bt_sock
         };
 
-        let (car_thing_server, CarThingServerChans { topic_tx }) =
-            spawn_car_thing_workers(Box::new(bt_sock.try_clone()?), Box::new(bt_sock))
-                .context("constructing carthing client")?;
+        let (
+            car_thing_server,
+            CarThingServerChans {
+                topic_tx,
+                rpc_req_rx,
+                rpc_res_tx,
+                state_req_rx,
+            },
+        ) = spawn_car_thing_workers(Box::new(bt_sock.try_clone()?), Box::new(bt_sock))
+            .context("constructing carthing client")?;
 
-        let deskthing_server = spawn_deskthing_bridge_workers(ws_tx, ws_rx, topic_tx)
-            .context("constructing deskthing bridge server")?;
+        let deskthing_server = spawn_deskthing_bridge_workers(
+            ws_tx,
+            ws_rx,
+            topic_tx,
+            state_req_rx,
+            rpc_req_rx,
+            rpc_res_tx,
+        )
+        .context("constructing deskthing bridge server")?;
 
         // let the servers run
         {

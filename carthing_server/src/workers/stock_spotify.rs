@@ -7,8 +7,25 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 
+pub struct CarThingRpcReq {
+    pub req_id: u64,
+    pub proc: String,
+    pub args: Vec<serde_json::Value>,
+    pub kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+pub struct CarThingRpcRes {
+    pub req_id: u64,
+    pub details: serde_json::Map<String, serde_json::Value>,
+    pub args: serde_json::Map<String, serde_json::Value>, // this should be an array, but spotify uses it as a dict
+    pub kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
 pub struct CarThingServerChans {
     pub topic_tx: Sender<(String, serde_json::Value, usize)>,
+    pub state_req_rx: Receiver<String>,
+    pub rpc_req_rx: Receiver<CarThingRpcReq>,
+    pub rpc_res_tx: Sender<CarThingRpcRes>,
 }
 
 pub fn spawn_car_thing_workers(
@@ -18,6 +35,9 @@ pub fn spawn_car_thing_workers(
     let (in_tx, in_rx) = crossbeam_channel::unbounded();
     let (out_tx, out_rx) = crossbeam_channel::unbounded();
     let (topic_tx, topic_rx) = crossbeam_channel::unbounded();
+    let (rpc_req_tx, rpc_req_rx) = crossbeam_channel::unbounded();
+    let (rpc_res_tx, rpc_res_rx) = crossbeam_channel::unbounded();
+    let (state_req_tx, state_req_rx) = crossbeam_channel::unbounded();
 
     let tx_worker = {
         std::thread::spawn(move || {
@@ -39,7 +59,16 @@ pub fn spawn_car_thing_workers(
 
     let wamp_worker = {
         std::thread::spawn(move || {
-            if let Err(e) = CarThingWampWorker::new(in_rx, out_tx, topic_rx).run() {
+            if let Err(e) = CarThingWampWorker::new(
+                in_rx,
+                out_tx,
+                topic_rx,
+                state_req_tx,
+                rpc_req_tx,
+                rpc_res_rx,
+            )
+            .run()
+            {
                 println!("socket recv error: {:?}", e);
                 std::process::abort();
             }
@@ -52,7 +81,12 @@ pub fn spawn_car_thing_workers(
             rx_worker,
             wamp_worker,
         },
-        CarThingServerChans { topic_tx },
+        CarThingServerChans {
+            topic_tx,
+            rpc_req_rx,
+            rpc_res_tx,
+            state_req_rx,
+        },
     ))
 }
 
@@ -151,6 +185,9 @@ struct CarThingWampWorker {
     rx: Receiver<(u32, serde_json::Value)>,
     tx: Sender<serde_json::Value>,
     topic_rx: Receiver<(String, serde_json::Value, usize)>,
+    state_req_tx: Sender<String>,
+    rpc_req_tx: Sender<CarThingRpcReq>,
+    rpc_res_rx: Receiver<CarThingRpcRes>,
 
     is_authed: bool,
     next_sub_id: usize,
@@ -162,11 +199,17 @@ impl CarThingWampWorker {
         rx: Receiver<(u32, serde_json::Value)>,
         tx: Sender<serde_json::Value>,
         topic_rx: Receiver<(String, serde_json::Value, usize)>,
+        state_req_tx: Sender<String>,
+        rpc_req_tx: Sender<CarThingRpcReq>,
+        rpc_res_rx: Receiver<CarThingRpcRes>,
     ) -> Self {
         Self {
             rx,
             tx,
             topic_rx,
+            state_req_tx,
+            rpc_req_tx,
+            rpc_res_rx,
 
             is_authed: false,
             next_sub_id: 1,
@@ -178,6 +221,7 @@ impl CarThingWampWorker {
         enum Event {
             Msg(u32, serde_json::Value),
             Topic(String, serde_json::Value, usize),
+            Rpc(CarThingRpcRes),
         }
 
         loop {
@@ -189,6 +233,9 @@ impl CarThingWampWorker {
                 recv(self.topic_rx) -> msg => {
                     let (topic, details, pub_id) = msg?;
                     Event::Topic(topic, details, pub_id)
+                },
+                recv(self.rpc_res_rx) -> msg => {
+                    Event::Rpc(msg?)
                 },
             };
 
@@ -225,6 +272,18 @@ impl CarThingWampWorker {
                         details
                     ]))?;
                 }
+                Event::Rpc(CarThingRpcRes {
+                    req_id,
+                    details,
+                    args,
+                    kwargs,
+                }) => self.tx.send(json!([
+                    WampMsgCode::Result as u64,
+                    req_id,
+                    details,
+                    args,
+                    kwargs
+                ]))?,
             }
         }
     }
@@ -366,7 +425,7 @@ impl CarThingWampWorker {
                 }
 
                 // jank jank jank
-                match self.handle_rpc(proc, args, kwargs)? {
+                match self.handle_rpc(req_id, proc, args, kwargs)? {
                     nil @ serde_json::Value::Null => nil,
                     res => json!([WampMsgCode::Result as u64, req_id, {}, res]),
                 }
@@ -379,9 +438,10 @@ impl CarThingWampWorker {
 
     fn handle_rpc(
         &self,
+        req_id: u64,
         proc: &str,
-        _args: &[serde_json::Value],
-        _kwargs: &serde_json::Map<String, serde_json::Value>,
+        args: &[serde_json::Value],
+        kwargs: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let res = match proc {
             "com.spotify.superbird.pitstop.log"
@@ -398,7 +458,14 @@ impl CarThingWampWorker {
             "com.spotify.superbird.register_device" => json!({}),
 
             _ => {
-                println!("warning: unknown RPC: {proc}");
+                self.rpc_req_tx
+                    .send(CarThingRpcReq {
+                        req_id,
+                        proc: proc.to_owned(),
+                        args: args.to_owned(),
+                        kwargs: kwargs.to_owned(),
+                    })
+                    .context("forwarding rpc")?;
                 json!(null)
             }
         };
@@ -418,6 +485,9 @@ impl CarThingWampWorker {
         let sub_id = self.next_sub_id;
         self.next_sub_id += 1;
         *self.subs.entry(topic.to_owned()).or_default() = sub_id;
+
+        self.state_req_tx.send(topic.to_owned())?;
+
         Ok(sub_id)
     }
 }
