@@ -43,7 +43,6 @@ pub fn spawn_car_thing_workers(
         std::thread::spawn(move || {
             if let Err(e) = CarThingTxWorker::new(tx_sock, out_rx).run() {
                 println!("socket send error: {:?}", e);
-                std::process::abort();
             }
         })
     };
@@ -52,7 +51,6 @@ pub fn spawn_car_thing_workers(
         std::thread::spawn(move || {
             if let Err(e) = CarThingRxWorker::new(rx_sock, in_tx).run() {
                 println!("socket recv error: {:?}", e);
-                std::process::abort();
             }
         })
     };
@@ -70,7 +68,6 @@ pub fn spawn_car_thing_workers(
             .run()
             {
                 println!("socket recv error: {:?}", e);
-                std::process::abort();
             }
         })
     };
@@ -466,7 +463,7 @@ impl CarThingWampWorker {
                         "use_volume_superbird_namespace": true,
                         "use_playerstate_superbird_namespace": false,
                         "use_superbird_namespace": false,
-                        "graphql_endpoint_enabled": true,
+                        "graphql_endpoint_enabled": false,
 
                         "non_spotify_playback_android": true,
                         "non_spotify_playback_ios": false,

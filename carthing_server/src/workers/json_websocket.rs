@@ -37,14 +37,12 @@ pub fn spawn_json_websocket_workers(
     let ws_rx_worker = std::thread::spawn(move || {
         if let Err(e) = JsonWebsocketRxWorker::new(ws_rx, in_tx).run() {
             println!("ws recv error: {:?}", e);
-            std::process::abort();
         }
     });
 
     let ws_tx_worker = std::thread::spawn(move || {
         if let Err(e) = JsonWebsocketTxWorker::new(ws_tx, out_rx).run() {
             println!("ws recv error: {:?}", e);
-            std::process::abort();
         }
     });
 
