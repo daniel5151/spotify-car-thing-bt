@@ -86,7 +86,6 @@ impl DeskthingRxWorker {
                 let msg = msg["result"].take();
 
                 let default_details = serde_json::Value::Object(serde_json::Map::new());
-                // this should be an array, but spotify uses it as a dict
                 let default_args = serde_json::Value::Object(serde_json::Map::new());
                 let default_kwargs = serde_json::Value::Object(serde_json::Map::new());
 
@@ -98,7 +97,7 @@ impl DeskthingRxWorker {
                 let (req_id, details, args, kwargs) = match (
                     req_id.as_u64(),
                     details.as_object(),
-                    args.as_object(),
+                    Some(args),
                     kwargs.as_object(),
                 ) {
                     (None, _, _, _) => anyhow::bail!("invalid reqId: {}", req_id),

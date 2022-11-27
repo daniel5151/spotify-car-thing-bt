@@ -17,7 +17,7 @@ pub struct CarThingRpcReq {
 pub struct CarThingRpcRes {
     pub req_id: u64,
     pub details: serde_json::Map<String, serde_json::Value>,
-    pub args: serde_json::Map<String, serde_json::Value>, // this should be an array, but spotify uses it as a dict
+    pub args: serde_json::Value, // not true WAMP - this should be an array
     pub kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
